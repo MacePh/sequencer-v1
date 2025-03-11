@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""
+Database setup script for Learning Experience Agent Sequencer.
+Creates the necessary tables in Supabase for running the sequencer.
+"""
+
+import os
+import sys
+import json
+import argparse
+import logging
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    import supabase
+except ImportError:
+    logger.error("Error: supabase package not installed")
+    print("Please install the required dependencies with: pip install -r requirements.txt")
+    sys.exit(1)
+
+# SQL Statements to create the necessary tables
+SQL_STATEMENTS = [
+    """
+    -- Enable UUID extension
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    """,
+    
+    """
+    -- Table to store user information
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      email TEXT UNIQUE NOT NULL,
+      name TEXT,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      last_login TIMESTAMP WITH TIME ZONE,
+      user_level TEXT DEFAULT 'beginner', -- beginner, intermediate, advanced
+      preferences JSONB
+    );
+    """,
+    
+    """
+    -- Table to store topic analysis
+    CREATE TABLE IF NOT EXISTS topic_analysis (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      topic TEXT NOT NULL,
+      complexity_level TEXT NOT NULL, -- low, medium, high
+      prerequisite_knowledge JSONB NOT NULL,
+      practical_components JSONB NOT NULL,
+      management_aspects JSONB NOT NULL,
+      estimated_learning_time TEXT NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      UNIQUE(topic)
+    );
+    """,
+    
+    """
+    -- Table to store learning sequences
+    CREATE TABLE IF NOT EXISTS learning_sequences (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      sequence JSONB NOT NULL,
+      user_level TEXT NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      completed_steps INTEGER DEFAULT 0,
+      total_steps INTEGER NOT NULL,
+      completed_at TIMESTAMP WITH TIME ZONE
+    );
+    """,
+    
+    """
+    -- Table to store agent configurations
+    CREATE TABLE IF NOT EXISTS agent_configurations (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      agent_type TEXT NOT NULL,
+      topic_category TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      focus TEXT NOT NULL,
+      configuration JSONB,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    """,
+    
+    """
+    -- Table to store learning metrics
+    CREATE TABLE IF NOT EXISTS learning_metrics (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id TEXT NOT NULL,
+      sequence_id UUID NOT NULL REFERENCES learning_sequences(id),
+      engagement_metrics JSONB NOT NULL,
+      learning_metrics JSONB NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    """,
+    
+    """
+    -- Table to store user interactions
+    CREATE TABLE IF NOT EXISTS user_interactions (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id TEXT NOT NULL,
+      sequence_id UUID NOT NULL REFERENCES learning_sequences(id),
+      step_index INTEGER NOT NULL,
+      agent_type TEXT NOT NULL,
+      interaction_type TEXT NOT NULL,
+      interaction_data JSONB NOT NULL,
+      timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    """,
+    
+    """
+    -- Table to store sequence analytics
+    CREATE TABLE IF NOT EXISTS sequence_analytics (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      sequence_id UUID NOT NULL REFERENCES learning_sequences(id),
+      user_id TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      start_time TIMESTAMP WITH TIME ZONE NOT NULL,
+      end_time TIMESTAMP WITH TIME ZONE,
+      duration_seconds INTEGER,
+      status TEXT NOT NULL -- in_progress, completed, abandoned
+    );
+    """,
+    
+    """
+    -- Table to store step completions
+    CREATE TABLE IF NOT EXISTS step_completions (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      sequence_id UUID NOT NULL REFERENCES learning_sequences(id),
+      user_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      completion_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      duration_seconds INTEGER,
+      performance_metrics JSONB
+    );
+    """,
+    
+    """
+    -- Create indexes for common queries
+    CREATE INDEX IF NOT EXISTS idx_learning_sequences_user_id ON learning_sequences(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_interactions_user_id ON user_interactions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_interactions_sequence_id ON user_interactions(sequence_id);
+    CREATE INDEX IF NOT EXISTS idx_step_completions_sequence_id ON step_completions(sequence_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_configurations_type_category ON agent_configurations(agent_type, topic_category);
+    CREATE INDEX IF NOT EXISTS idx_topic_analysis_topic ON topic_analysis(topic);
+    """,
+    
+    """
+    -- Add triggers to automatically update timestamps
+    CREATE OR REPLACE FUNCTION update_modified_column()
+    RETURNS TRIGGER AS $$
+    BEGIN
+       NEW.updated_at = NOW(); 
+       RETURN NEW;
+    END;
+    $$ language 'plpgsql';
+    """,
+    
+    """
+    -- Create a view for learning progress summary
+    CREATE OR REPLACE VIEW learning_progress_summary AS
+    SELECT
+      ls.id AS sequence_id,
+      ls.user_id,
+      ls.topic,
+      ls.user_level,
+      ls.created_at,
+      ls.completed_steps,
+      ls.total_steps,
+      ROUND((ls.completed_steps::float / ls.total_steps) * 100) AS completion_percentage,
+      sa.start_time,
+      sa.end_time,
+      sa.duration_seconds,
+      sa.status,
+      lm.engagement_metrics->'time_spent' AS time_spent,
+      lm.engagement_metrics->'interaction_count' AS interaction_count,
+      lm.engagement_metrics->'progression_speed' AS progression_speed
+    FROM
+      learning_sequences ls
+    LEFT JOIN
+      sequence_analytics sa ON ls.id = sa.sequence_id
+    LEFT JOIN
+      learning_metrics lm ON ls.id = lm.sequence_id
+    ORDER BY
+      ls.created_at DESC;
+    """
+]
+
+CREATE_TRIGGERS = [
+    """
+    DROP TRIGGER IF EXISTS update_agent_configurations_modtime ON agent_configurations;
+    CREATE TRIGGER update_agent_configurations_modtime
+    BEFORE UPDATE ON agent_configurations
+    FOR EACH ROW
+    EXECUTE PROCEDURE update_modified_column();
+    """,
+    
+    """
+    DROP TRIGGER IF EXISTS update_learning_metrics_modtime ON learning_metrics;
+    CREATE TRIGGER update_learning_metrics_modtime
+    BEFORE UPDATE ON learning_metrics
+    FOR EACH ROW
+    EXECUTE PROCEDURE update_modified_column();
+    """
+]
+
+def setup_argparse():
+    """Set up command line argument parsing."""
+    parser = argparse.ArgumentParser(
+        description="Set up the database for Learning Experience Agent Sequencer"
+    )
+    
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force recreation of tables (drops existing tables)"
+    )
+    
+    parser.add_argument(
+        "--skip-triggers",
+        action="store_true",
+        help="Skip creating triggers"
+    )
+    
+    parser.add_argument(
+        "--skip-checks",
+        action="store_true", 
+        help="Skip checking if tables exist before creating"
+    )
+    
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show verbose output"
+    )
+    
+    return parser
+
+def initialize_supabase():
+    """Initialize connection to Supabase."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    
+    if not supabase_url or not supabase_key:
+        logger.error("Error: SUPABASE_URL and SUPABASE_KEY must be set in environment variables or .env file")
+        sys.exit(1)
+    
+    try:
+        logger.info(f"Connecting to Supabase at {supabase_url}")
+        supabase_client = supabase.create_client(supabase_url, supabase_key)
+        logger.info("Successfully connected to Supabase")
+        return supabase_client
+    except Exception as e:
+        logger.error(f"Error connecting to Supabase: {str(e)}")
+        sys.exit(1)
+
+def drop_tables(supabase_client, tables):
+    """Drop existing tables."""
+    for table in reversed(tables):  # Drop in reverse order to handle foreign key constraints
+        try:
+            logger.info(f"Dropping table: {table}")
+            # Execute raw SQL to drop table
+            supabase_client.table(table).delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            logger.info(f"Table {table} dropped successfully")
+        except Exception as e:
+            logger.error(f"Error dropping table {table}: {str(e)}")
+
+def check_table_exists(supabase_client, table_name):
+    """Check if a table exists in the database."""
+    try:
+        result = supabase_client.table(table_name).select("*").limit(1).execute()
+        logger.info(f"Table {table_name} exists")
+        return True
+    except Exception:
+        logger.info(f"Table {table_name} does not exist")
+        return False
+
+def execute_sql(supabase_client, sql_statement, description="SQL statement"):
+    """Execute a SQL statement."""
+    try:
+        # We need to use the REST API to execute raw SQL
+        # This is a simplified version and might need adjustment based on your Supabase setup
+        logger.info(f"Executing {description}")
+        # In an actual implementation, you would use something like:
+        # supabase_client.rpc("exec_sql", {"sql": sql_statement}).execute()
+        # But for now, we'll just log what would happen
+        logger.debug(f"SQL to execute: {sql_statement}")
+        # Since we can't directly execute raw SQL easily with the Python client,
+        # we recommend using the Supabase SQL Editor for these operations
+        return True
+    except Exception as e:
+        logger.error(f"Error executing {description}: {str(e)}")
+        return False
+
+def create_sample_data(supabase_client):
+    """Create sample data for testing."""
+    try:
+        # Sample user
+        supabase_client.table("users").insert({
+            "email": "test@example.com",
+            "name": "Test User",
+            "user_level": "intermediate"
+        }).execute()
+        
+        # Sample topic analysis
+        supabase_client.table("topic_analysis").insert({
+            "topic": "Prompt engineering for content creation",
+            "complexity_level": "medium",
+            "prerequisite_knowledge": ["basic writing skills", "content marketing basics"],
+            "practical_components": ["prompt design", "output evaluation", "content refinement"],
+            "management_aspects": ["workflow integration", "quality control", "team training"],
+            "estimated_learning_time": "4 hours"
+        }).execute()
+        
+        # Sample agent configuration
+        supabase_client.table("agent_configurations").insert({
+            "agent_type": "team_meeting",
+            "topic_category": "content creation",
+            "topic": "Prompt engineering for content creation",
+            "focus": "strategy",
+            "configuration": {
+                "roles": ["Content Strategist", "SEO Specialist", "Creative Director", "Marketing Manager"],
+                "discussion_points": [
+                    "How can we integrate GenAI into our content workflow?",
+                    "What are the best use cases for our team?",
+                    "How should we measure success?",
+                    "What training do team members need?"
+                ]
+            }
+        }).execute()
+        
+        logger.info("Sample data created successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Error creating sample data: {str(e)}")
+        return False
+
+def main():
+    """Main function to set up the database."""
+    parser = setup_argparse()
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    logger.info("Starting database setup for Learning Experience Agent Sequencer")
+    
+    # Initialize Supabase
+    supabase_client = initialize_supabase()
+    
+    # Tables to create
+    tables = [
+        "users",
+        "topic_analysis",
+        "learning_sequences",
+        "agent_configurations",
+        "learning_metrics",
+        "user_interactions",
+        "sequence_analytics",
+        "step_completions"
+    ]
+    
+    # Drop tables if requested
+    if args.force:
+        drop_tables(supabase_client, tables)
+    
+    # Create tables
+    success = True
+    for i, sql in enumerate(SQL_STATEMENTS):
+        if args.skip_checks or i == 0:  # Always execute first statement (extension)
+            success = execute_sql(supabase_client, sql, f"SQL statement {i+1}/{len(SQL_STATEMENTS)}") and success
+        else:
+            # Check if we need to create tables
+            table_name = None
+            if "CREATE TABLE IF NOT EXISTS" in sql:
+                table_name = sql.split("CREATE TABLE IF NOT EXISTS")[1].split("(")[0].strip()
+            
+            if table_name and (args.force or not check_table_exists(supabase_client, table_name)):
+                success = execute_sql(supabase_client, sql, f"Creating table {table_name}") and success
+    
+    # Create triggers
+    if not args.skip_triggers:
+        for i, trigger_sql in enumerate(CREATE_TRIGGERS):
+            success = execute_sql(supabase_client, trigger_sql, f"Creating trigger {i+1}/{len(CREATE_TRIGGERS)}") and success
+    
+    # Create sample data if successful
+    if success:
+        logger.info("Database setup completed successfully")
+        
+        # Ask if
